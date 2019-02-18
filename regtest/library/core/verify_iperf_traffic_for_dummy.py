@@ -20,6 +20,8 @@
 
 import shlex
 
+import time
+
 from collections import OrderedDict
 
 from ansible.module_utils.basic import AnsibleModule
@@ -107,8 +109,10 @@ def execute_commands(module, cmd):
     :return: Output of the commands.
     """
     global HASH_DICT
-
-    out = run_cli(module, cmd)
+    if ('service' in cmd and 'restart' in cmd) or module.params['dry_run_mode']:
+        out = None
+    else:
+        out = run_cli(module, cmd)
 
     # Store command prefixed with exec time as key and
     # command output as value in the hash dictionary
@@ -130,6 +134,8 @@ def verify_traffic(module):
     switch_name = module.params['switch_name']
     switch_list = module.params['switch_list']
     packet_size_list = module.params['packet_size_list'].split(',')
+    delay = module.params['delay']
+    retries = module.params['retries']
 
     switch_list.remove(switch_name)
     neighbor_switch = switch_list[0]
@@ -138,29 +144,38 @@ def verify_traffic(module):
     neighbor_ip = '192.168.{}.1'.format(neighbor_switch[-2::])
 
     # Verify ping
-    packet_count = '3'
-    ping_cmd = 'ping -w 3 -c {} -I {} {}'.format(packet_count,
-                                                 self_ip, neighbor_ip)
-    ping_out = execute_commands(module, ping_cmd)
-    if '{} received'.format(packet_count) not in ping_out:
-        RESULT_STATUS = False
-        failure_summary += 'From switch {}, '.format(switch_name)
-        failure_summary += '{} is not getting pinged\n'.format(neighbor_switch)
-
-    # Initiate iperf client and verify traffic
-    for size in packet_size_list:
-        port += 1
-        traffic_cmd = 'iperf -c {} -t 5 -M {} -p {} -P 1 -B {}'.format(
-            neighbor_ip, size, port, self_ip
-        )
-        traffic_out = execute_commands(module, traffic_cmd)
-
-        if ('Transfer' not in traffic_out and 'Bandwidth' not in traffic_out and
-                'Bytes' not in traffic_out and 'bits/sec' not in traffic_out):
+    while(retries):
+        failure_summary = ''
+        RESULT_STATUS = True
+        packet_count = '3'
+        ping_cmd = 'ping -w 3 -c {} -I {} {}'.format(packet_count,
+                                                     self_ip, neighbor_ip)
+        ping_out = execute_commands(module, ping_cmd)
+        if '{} received'.format(packet_count) not in ping_out:
             RESULT_STATUS = False
-            failure_summary += 'On switch {} '.format(switch_name)
-            failure_summary += 'iperf traffic cannot be verified for '
-            failure_summary += 'packet size length {} bytes\n'.format(size)
+            failure_summary += 'From switch {}, '.format(switch_name)
+            failure_summary += '{} is not getting pinged\n'.format(neighbor_switch)
+
+        # Initiate iperf client and verify traffic
+        for size in packet_size_list:
+            port += 1
+            traffic_cmd = 'iperf -c {} -t 5 -M {} -p {} -P 1 -B {}'.format(
+                neighbor_ip, size, port, self_ip
+            )
+            traffic_out = execute_commands(module, traffic_cmd)
+
+            if ('Transfer' not in traffic_out and 'Bandwidth' not in traffic_out and
+                    'Bytes' not in traffic_out and 'bits/sec' not in traffic_out):
+                RESULT_STATUS = False
+                failure_summary += 'On switch {} '.format(switch_name)
+                failure_summary += 'iperf traffic cannot be verified for '
+                failure_summary += 'packet size length {} bytes\n'.format(size)
+
+        if not RESULT_STATUS:
+            time.sleep(delay)
+            retries -= 1
+        else:
+            break
 
     HASH_DICT['result.detail'] = failure_summary
 
@@ -173,6 +188,9 @@ def main():
     module = AnsibleModule(
         argument_spec=dict(
             switch_name=dict(required=False, type='str'),
+            delay=dict(required=False, type='int'),
+            retries=dict(required=False, type='int'),
+            dry_run_mode=dict(required=False, type='bool', default=False),
             switch_list=dict(required=False, type='list'),
             packet_size_list=dict(required=False, type='str'),
             hash_name=dict(required=False, type='str'),
@@ -182,30 +200,66 @@ def main():
 
     global HASH_DICT, RESULT_STATUS
 
-    # Verify iperf traffic
-    verify_traffic(module)
+    if module.params['dry_run_mode']:
+        port = 5000
+        packet_size_list = module.params['packet_size_list'].split(',')
+        cmds_list = []
 
-    # Calculate the entire test result
-    HASH_DICT['result.status'] = 'Passed' if RESULT_STATUS else 'Failed'
+        switch_name = module.params['switch_name']
+        switch_list = module.params['switch_list']
 
-    # Create a log file
-    log_file_path = module.params['log_dir_path']
-    log_file_path += '/{}.log'.format(module.params['hash_name'])
-    log_file = open(log_file_path, 'a')
-    for key, value in HASH_DICT.iteritems():
-        log_file.write(key)
-        log_file.write('\n')
-        log_file.write(str(value))
-        log_file.write('\n')
-        log_file.write('\n')
+        switch_list.remove(switch_name)
+        neighbor_switch = switch_list[0]
 
-    log_file.close()
+        self_ip = '192.168.{}.1'.format(switch_name[-2::])
+        neighbor_ip = '192.168.{}.1'.format(neighbor_switch[-2::])
 
-    # Exit the module and return the required JSON.
-    module.exit_json(
-        hash_dict=HASH_DICT,
-        log_file_path=log_file_path
-    )
+        # Verify ping
+        packet_count = '3'
+        ping_cmd = 'ping -w 3 -c {} -I {} {}'.format(packet_count,
+                                                     self_ip, neighbor_ip)
+        execute_commands(module, ping_cmd)
+
+        for size in packet_size_list:
+            port += 1
+            traffic_cmd = 'iperf -c {} -t 5 -M {} -p {} -P 1 -B {}'.format(
+                neighbor_ip, size, port, self_ip
+            )
+            execute_commands(module, traffic_cmd)
+
+        execute_commands(module, 'goes status')
+
+        for key, value in HASH_DICT.iteritems():
+            cmds_list.append(key)
+        # Exit the module and return the required JSON.
+        module.exit_json(
+            cmds=cmds_list
+        )
+    else:
+        # Verify iperf traffic
+        verify_traffic(module)
+
+        # Calculate the entire test result
+        HASH_DICT['result.status'] = 'Passed' if RESULT_STATUS else 'Failed'
+
+        # Create a log file
+        log_file_path = module.params['log_dir_path']
+        log_file_path += '/{}.log'.format(module.params['hash_name'])
+        log_file = open(log_file_path, 'a')
+        for key, value in HASH_DICT.iteritems():
+            log_file.write(key)
+            log_file.write('\n')
+            log_file.write(str(value))
+            log_file.write('\n')
+            log_file.write('\n')
+
+        log_file.close()
+
+        # Exit the module and return the required JSON.
+        module.exit_json(
+            hash_dict=HASH_DICT,
+            log_file_path=log_file_path
+        )
 
 if __name__ == '__main__':
     main()

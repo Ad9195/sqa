@@ -1,5 +1,17 @@
 ---
 
+- hosts: leaf:spine
+  become: true
+  ignore_errors: yes
+  tasks:
+    - shell: dpkg --list | grep kernel
+      register: kernel_version
+      when: not dry_run
+
+    - debug:
+        var: kernel_version.stdout_lines
+      when: not dry_run
+
 - hosts: server_emulator
   become: true
 
@@ -18,30 +30,35 @@
     - name: Add dummy interface
       add_dummy_interface:
         switch_name: "{{ inventory_hostname }}"
+      when: not dry_run
 
     - name: Take backup of /etc/bird/bird.conf
       copy:
         src: "{{ bird_conf_file }}"
         dest: "{{ bird_conf_file_bck }}"
         remote_src: true
+      when: not dry_run
 
     - name: Add bgp config in /etc/bird/bird.conf
       copy:
         src: ../../files/{{inventory_hostname}}/bird_bgp_peering_ebgp_route_advertise.conf
         dest: "{{ bird_conf_file }}"
+      when: not dry_run
 
     - name: Restart bird
       service:
         name: bird
         state: restarted
+      when: not dry_run
 
-    - name: Wait few seconds for bgp convergence
+    - name: Waiting for few seconds
       pause:
-        seconds: 35
+        seconds: "{{ package_delay }}"
 
     - file:
         path: "{{ bgp_log_dir }}"
         state: directory
+      when: not dry_run
 
 
 - hosts: leaf[0]:spine
@@ -50,6 +67,8 @@
     - name: Verify bird bgp peering convergence
       test_bird_peering_state_propagation:
         switch_name: "{{ inventory_hostname }}"
+        delay: "{{ package_delay }}"
+        retries: "{{ package_retry }}"
         package_name: "bird"
         is_convergence: True
         spine_list: "{{ groups['spine'] }}"
@@ -57,14 +76,29 @@
         hash_name: "{{ hostvars['server_emulator']['hash_name'] }}"
         log_dir_path: "{{ bgp_log_dir }}"
       register: module_out
+      when: not dry_run
+
+    - name: Verify bird bgp peering convergence
+      test_bird_peering_state_propagation:
+        dry_run_mode: "{{ dry_run }}"
+        is_convergence: True
+      register: dry_run_out
+      delegate_to: 127.0.0.1
+      when: dry_run
+
+    - set_fact:
+        dry_run_cmds: "{{ dry_run_out.cmds }}"
+      when: dry_run
 
     - command: "date +%Y%m%d%T"
       register: end_time
+      when: not dry_run
 
     - name: Fetch the log file
       slurp:
         src: "{{ module_out.log_file_path }}"
       register: logs
+      when: not dry_run
 
     - name: Store the test result in a hash in redis db on server emulator
       store_result_in_redis:
@@ -74,6 +108,8 @@
         hash_dict: "{{ module_out.hash_dict }}"
         log_content: "{{ logs['content'] | b64decode }}"
       delegate_to: 127.0.0.1
+      ignore_errors: yes
+      when: not dry_run
 
 
 - hosts: leaf[1]
@@ -84,15 +120,13 @@
         path: "{{ bird_conf_file }}"
         regexp: "interface 'dummy0'"
         state: absent
+      when: not dry_run
 
     - name: Restart bird
       service:
         name: bird
         state: restarted
-
-    - name: Wait for few seconds for bgp convergence
-      pause:
-        seconds: 20
+      when: not dry_run
 
 
 - hosts: leaf[0]:spine
@@ -105,18 +139,35 @@
         is_convergence: True
         propagate_switch: "{{ groups['leaf'][1] }}"
         spine_list: "{{ groups['spine'] }}"
+        retries: "{{ package_retry }}"
+        delay: "{{ package_delay }}"
         leaf_list: "{{ groups['leaf'] }}"
         hash_name: "{{ hostvars['server_emulator']['hash_name'] }}"
         log_dir_path: "{{ bgp_log_dir }}"
       register: module_out
+      when: not dry_run
+
+    - name: Verify bird bgp peering convergence
+      test_bird_peering_state_propagation:
+        is_convergence: True
+        dry_run_mode: "{{ dry_run }}"
+      register: dry_run_out
+      delegate_to: 127.0.0.1
+      when: dry_run
+
+    - set_fact:
+        dry_run_cmds: "{{ dry_run_out.cmds }}"
+      when: dry_run
 
     - command: "date +%Y%m%d%T"
       register: end_time
+      when: not dry_run
 
     - name: Fetch the log file
       slurp:
         src: "{{ module_out.log_file_path }}"
       register: logs
+      when: not dry_run
 
     - name: Store the test result in a hash in redis db on server emulator
       store_result_in_redis:
@@ -126,31 +177,21 @@
         hash_dict: "{{ module_out.hash_dict }}"
         log_content: "{{ logs['content'] | b64decode }}"
       delegate_to: 127.0.0.1
+      ignore_errors: yes
+      when: not dry_run
 
 
 - hosts: leaf:spine
   become: true
   tasks:
     - include: ../../playbooks/get_goes_version_and_tags.yml
+      when: not dry_run
 
-    - name: Restore backup of /etc/bird/bird.conf
-      copy:
-        src: "{{ bird_conf_file_bck }}"
-        dest: "{{ bird_conf_file }}"
-        remote_src: true
 
-    - name: Remove backup file
-      file:
-        path: "{{ bird_conf_file_bck }}"
-        state: absent
-
-    - name: Delete dummy interface
-      command: "ip link del dummy0 type dummy"
-
-    - name: Restart bird
-      service:
-        name: bird
-        state: restarted
+- include: bird_bgp_peering_convergence_reset.yml
+  when:
+    - reset_config
+    - not dry_run
 
 
 - hosts: server_emulator
@@ -160,17 +201,33 @@
       get_test_result_from_redis:
         hash_name: "{{ hostvars['server_emulator']['hash_name'] }}"
       register: result
+      when: not dry_run
 
     - name: Print test case result
       debug:
         msg: "Test case result: {{ result.result_status }}"
+      when: not dry_run
 
     - name: Print failure summary
       debug:
         msg: "Failure summary: {{ result.result_detail }}"
+      when: not dry_run
+
+    - lineinfile:
+        path: "{{ regression_summary_report }}"
+        line: "{{ hash_name }}: {{ result.result_status }}"
+      when: not dry_run
 
 
 - hosts: leaf:spine
   become: true
+  gather_facts: no
   tasks:
-    - include: ../../playbooks/get_goes_status.yml
+    - include: ../../playbooks/get_goes_status.yml start_time={{ hostvars['server_emulator']['start_time'] }} hash_name={{ hostvars['server_emulator']['hash_name'] }}
+      when: not dry_run
+
+    - name: Print dry run output
+      debug:
+        var: dry_run_cmds
+      delegate_to: 127.0.0.1
+      when: dry_run

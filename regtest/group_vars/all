@@ -1,5 +1,19 @@
 ---
-ansible_log_file_path: ~/ansible.log
+dry_run: False
+reset_config: True
+platina_redis_channel: platina-mk1
+iface_type: platina-mk1
+
+goes_build_id: N/A(probably the current build doesn't support)
+goes_vnetd_id: N/A(probably the current build doesn't support)
+
+package_delay: 10
+package_retry: 6
+
+goes_delay: 10
+goes_retry: 3
+
+regression_summary_report: /var/log/regression/regression_summary_file_{{ testbed_name }}
 
 bgp_log_dir: /var/log/regression/bgp
 ospf_log_dir: /var/log/regression/ospf
@@ -8,6 +22,13 @@ ipv4_log_dir: /var/log/regression/ipv4
 port_provision_log_dir: /var/log/regression/port_provision
 redis_log_dir: /var/log/regression/redis
 vlan_log_dir: /var/log/regression/vlan
+upgrade_log_dir: /var/log/regression/upgrade
+boot_log_dir: /var/log/regression/boot
+docker_log_dir: /var/log/regression/docker
+link_flap_log_dir: /var/log/regression/link_flap
+issues_log_dir: /var/log/regression/issues
+snmp_log_dir: /var/log/regression/snmp
+snmptrapd_log_dir: /var/log/regression/snmptrapd
 
 bgp_loop_prevention_log_file: /var/log/regression/bgp_loop_prevention.log
 gobgp_loop_prevention_log_file: /var/log/gobgpd.dump
@@ -40,14 +61,26 @@ bird_conf_file_bck: /etc/bird/bird.conf.bck
 network_interfaces_file: /etc/network/interfaces
 network_interfaces_file_bck: /etc/network/interfaces.bck
 
+snmpd_conf_file: /etc/snmp/snmpd.conf
+snmp_conf_file: /etc/snmp/snmp.conf
+snmpd_conf_file_bck: /etc/snmp/snmpd.conf.bck
+snmp_conf_file_bck: /etc/snmp/snmp.conf.bck
+snmp_if_mib_file: /usr/share/snmp/mibs/
+snmptrapd_conf_file: /etc/snmp/snmptrapd.conf
+snmptrapd_file: /etc/default/snmptrapd
+
+xeth_config_file: /etc/lldpd.d/xeth.conf
+xeth_config_file_bck: /etc/lldpd.d/xeth_conf.bck
+
 goes_start_file: /etc/goes/start
 goes_start_file_bck: /etc/goes/start.bck
+goesd_modprobe_file: /etc/modprobe.d/goesd-platina-mk1-modprobe.conf
 
 goes_url_path: 'http://downloads.platinasystems.com/LATEST/'
 goes_installer_dir: '/tmp/'
 goes_upgrade_installer_name: 'goes-platina-mk1-installer.up'
 goes_downgrade_installer_name: 'goes-platina-mk1-installer.dw'
-goes_installer_name: 'goes-platina-mk1-installer'
+goes_installer_name: 'goes-platina-mk1'
 goes_installer_url: '{{ goes_url_path }}{{ goes_installer_name }}'
 goes_coreboot_installer_name: 'coreboot-platina-mk1.rom'
 goes_coreboot_installer_url: '{{ goes_url_path }}{{ goes_coreboot_installer_name }}'
@@ -55,8 +88,16 @@ goes_coreboot_installer_url: '{{ goes_url_path }}{{ goes_coreboot_installer_name
 frr_installer_name: 'frr_3.0.3-1_debian8.1_amd64.deb'
 frr_link: 'https://github.com/FRRouting/frr/releases/download/frr-3.0.3/{{ frr_installer_name }}'
 
-gobgp_installer_name: 'gobgp_1.26_linux_amd64.tar.gz'
-gobgp_link: 'https://github.com/osrg/gobgp/releases/download/v1.26/{{ gobgp_installer_name }}'
+gobgp_installer_name: 'gobgp_2.0.0_linux_amd64.tar.gz'
+gobgp_link: 'https://github.com/osrg/gobgp/releases/download/v2.0.0/{{ gobgp_installer_name }}'
 gobgp_dir: /etc/gobgp
 
 docker_compose_file: ~/docker-compose.yml
+
+#Command to downgrade BMC to v0.4 version (testing purpose)
+#upgrade_cmd: 'upgrade -v v0.4 -s 172.17.2.28/downloads/ -f'
+
+#Command to upgrade BMC to latest version
+#upgrade_cmd: 'upgrade -v master -s downloads.platinasystems.com/TEST -f'
+upgrade_cmd: 'upgrade -v TEST1 -s 172.17.2.28/downloads'
+

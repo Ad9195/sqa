@@ -1,5 +1,16 @@
 ---
 
+- hosts: leaf:spine
+  become: true
+  ignore_errors: yes
+  tasks:
+    - shell: dpkg --list | grep kernel
+      register: kernel_version
+
+    - debug:
+        var: kernel_version.stdout_lines
+
+
 - hosts: server_emulator
   become: true
 
@@ -38,7 +49,7 @@
 
     - name: Wait few seconds for ospf to establish connection
       pause:
-        seconds: 35
+        seconds: 55
 
     - file:
         path: "{{ ospf_log_dir }}"
@@ -49,6 +60,8 @@
         switch_name: "{{ inventory_hostname }}"
         config_file: "{{ lookup('file', '../../files/{{inventory_hostname}}/ospf_with_different_areas.conf') }}"
         package_name: "quagga"
+        spine_list: "{{ groups['spine'] }}"
+        leaf_list: "{{ groups['leaf'] }}"
         hash_name: "{{ hostvars['server_emulator']['hash_name'] }}"
         log_dir_path: "{{ ospf_log_dir }}"
       register: module_out
@@ -72,24 +85,9 @@
 
     - include: ../../playbooks/get_goes_version_and_tags.yml
 
-    - name: Restore backup of /etc/quagga/ospfd.conf
-      copy:
-        src: "{{ quagga_ospf_conf_file_bck }}"
-        dest: "{{ quagga_ospf_conf_file }}"
-        remote_src: true
 
-    - name: Remove backup file
-      file:
-        path: "{{ quagga_ospf_conf_file_bck }}"
-        state: absent
-
-    - name: Delete dummy interface
-      command: "ip link del dummy0 type dummy"
-
-    - name: Restart quagga
-      service:
-        name: quagga
-        state: restarted
+- include: quagga_ospf_with_different_areas_reset.yml
+  when: reset_config
 
 
 - hosts: server_emulator
@@ -108,8 +106,12 @@
       debug:
         msg: "Failure summary: {{ result.result_detail }}"
 
+    - lineinfile:
+        path: "{{ regression_summary_report }}"
+        line: "{{ hash_name }}: {{ result.result_status }}"
+
 
 - hosts: leaf:spine
   become: true
   tasks:
-    - include: ../../playbooks/get_goes_status.yml
+    - include: ../../playbooks/get_goes_status.yml start_time={{ hostvars['server_emulator']['start_time'] }} hash_name={{ hostvars['server_emulator']['hash_name'] }}

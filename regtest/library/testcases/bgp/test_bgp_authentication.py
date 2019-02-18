@@ -22,6 +22,8 @@ import shlex
 
 from collections import OrderedDict
 
+import time
+
 from ansible.module_utils.basic import AnsibleModule
 
 DOCUMENTATION = """
@@ -57,6 +59,12 @@ options:
         - Path to log directory where logs will be stored.
       required: False
       type: str
+    dry_run_mode:
+      description:
+        - Flag to indicate if module needs to be executed in dry run mode.
+      required: False
+      type: bool
+      default: False
 """
 
 EXAMPLES = """
@@ -65,6 +73,7 @@ EXAMPLES = """
     switch_name: "{{ inventory_hostname }}"
     hash_name: "{{ hostvars['server_emulator']['hash_name'] }}"
     log_dir_path: "{{ log_dir_path }}"
+    dry_run_mode: True
 """
 
 RETURN = """
@@ -106,7 +115,7 @@ def execute_commands(module, cmd):
     """
     global HASH_DICT
 
-    if 'service' in cmd and 'restart' in cmd:
+    if ('service' in cmd and 'restart' in cmd) or module.params['dry_run_mode']:
         out = None
     else:
         out = run_cli(module, cmd)
@@ -119,6 +128,48 @@ def execute_commands(module, cmd):
 
     return out
 
+def bgp_authentication(module):
+    global RESULT_STATUS, HASH_DICT
+    failure_summary = ''
+    RESULT_STATUS1 = True
+    neighbor_count = 0
+    switch_name = module.params['switch_name']
+    config_file = module.params['config_file'].splitlines()
+    # Get all ip routes
+    cmd = "vtysh -c 'sh ip bgp neighbors'"
+    bgp_out = execute_commands(module, cmd)
+    if bgp_out:
+        for line in config_file:
+            line = line.strip()
+            if 'neighbor' in line and 'remote-as' in line:
+                neighbor_count += 1
+                config = line.split()
+                neighbor_ip = config[1]
+                remote_as = config[3]
+                if neighbor_ip not in bgp_out or remote_as not in bgp_out:
+                    RESULT_STATUS1 = False
+                    failure_summary += 'On switch {} '.format(switch_name)
+                    failure_summary += 'bgp neighbor {} '.format(neighbor_ip)
+                    failure_summary += 'is not present in the output of '
+                    failure_summary += 'command {}\n'.format(cmd)
+
+        if bgp_out.count('BGP state = Established') != neighbor_count:
+            RESULT_STATUS1 = False
+            failure_summary += 'On switch {} '.format(switch_name)
+            failure_summary += 'bgp state of all/some neighbors '
+            failure_summary += 'are not Established in the output of '
+            failure_summary += 'command {}\n'.format(cmd)
+    else:
+        RESULT_STATUS1 = False
+        failure_summary += 'On switch {} '.format(switch_name)
+        failure_summary += 'bgp neighbor relationship cannot be verified '
+        failure_summary += 'because output of command {} '.format(cmd)
+        failure_summary += 'is None'
+
+    alist = [True if RESULT_STATUS1 else False]
+    alist.append(failure_summary)
+    return alist
+
 
 def verify_bgp_authentication(module):
     """
@@ -126,51 +177,24 @@ def verify_bgp_authentication(module):
     :param module: The Ansible module to fetch input parameters.
     """
     global RESULT_STATUS, HASH_DICT
-    failure_summary = ''
-    switch_name = module.params['switch_name']
     package_name = module.params['package_name']
-    config_file = module.params['config_file'].splitlines()
+    delay = module.params['delay']
+    retries = module.params['retries']
 
     # Get the current/running configurations
     execute_commands(module, "vtysh -c 'sh running-config'")
 
     # Restart and check package status
-    execute_commands(module, 'service {} restart'.format(package_name))
+    # execute_commands(module, 'service {} restart'.format(package_name))
     execute_commands(module, 'service {} status'.format(package_name))
+    retry = retries - 1
+    while(retry):
+        if bgp_authentication(module)[0]:
+            break
+        time.sleep(delay)
+        retry -= 1
 
-    # Get all ip routes
-    cmd = "vtysh -c 'sh ip bgp neighbors'"
-    bgp_out = execute_commands(module, cmd)
-
-    if bgp_out:
-        for line in config_file:
-            line = line.strip()
-            if 'neighbor' in line and 'remote-as' in line:
-                config = line.split()
-                neighbor_ip = config[1]
-                remote_as = config[3]
-                if neighbor_ip not in bgp_out or remote_as not in bgp_out:
-                    RESULT_STATUS = False
-                    failure_summary += 'On switch {} '.format(switch_name)
-                    failure_summary += 'bgp neighbor {} '.format(neighbor_ip)
-                    failure_summary += 'is not present in the output of '
-                    failure_summary += 'command {}\n'.format(cmd)
-
-                if 'BGP state = Established' not in bgp_out:
-                    RESULT_STATUS = False
-                    failure_summary += 'On switch {} '.format(switch_name)
-                    failure_summary += 'bgp state of neighbor {} '.format(
-                        neighbor_ip)
-                    failure_summary += 'is not Established in the output of '
-                    failure_summary += 'command {}\n'.format(cmd)
-    else:
-        RESULT_STATUS = False
-        failure_summary += 'On switch {} '.format(switch_name)
-        failure_summary += 'bgp neighbor relationship cannot be verified '
-        failure_summary += 'because output of command {} '.format(cmd)
-        failure_summary += 'is None\n'
-
-    HASH_DICT['result.detail'] = failure_summary
+    RESULT_STATUS, HASH_DICT['result.detail'] = bgp_authentication(module)[0], bgp_authentication(module)[1]
 
     # Get the GOES status info
     execute_commands(module, 'goes status')
@@ -185,34 +209,59 @@ def main():
             package_name=dict(required=False, type='str'),
             hash_name=dict(required=False, type='str'),
             log_dir_path=dict(required=False, type='str'),
+            delay=dict(required=False, type='int', default=10),
+            retries=dict(required=False, type='int', default=6),
+            dry_run_mode=dict(required=False, type='bool', default=False),
         )
     )
 
     global HASH_DICT, RESULT_STATUS
 
-    verify_bgp_authentication(module)
+    # In dry run mode, we need to only print the commands without
+    # their output
+    if module.params['dry_run_mode']:
+        package_name = module.params['package_name']
+        cmds_list = []
 
-    # Calculate the entire test result
-    HASH_DICT['result.status'] = 'Passed' if RESULT_STATUS else 'Failed'
+        execute_commands(module, "vtysh -c 'sh running-config'")
+        execute_commands(module, 'service {} restart'.format(package_name))
+        execute_commands(module, 'pause for 35 secs')
+        execute_commands(module, 'service {} status'.format(package_name))
+        execute_commands(module, "vtysh -c 'sh ip bgp neighbors'")
+        execute_commands(module, 'goes status')
 
-    # Create a log file
-    log_file_path = module.params['log_dir_path']
-    log_file_path += '/{}.log'.format(module.params['hash_name'])
-    log_file = open(log_file_path, 'w')
-    for key, value in HASH_DICT.iteritems():
-        log_file.write(key)
-        log_file.write('\n')
-        log_file.write(str(value))
-        log_file.write('\n')
-        log_file.write('\n')
+        for key, value in HASH_DICT.iteritems():
+            cmds_list.append(key)
 
-    log_file.close()
+        # Exit the module and return the required JSON.
+        module.exit_json(
+            cmds=cmds_list
+        )
+    else:
+        verify_bgp_authentication(module)
 
-    # Exit the module and return the required JSON.
-    module.exit_json(
-        hash_dict=HASH_DICT,
-        log_file_path=log_file_path
-    )
+        # Calculate the entire test result
+        HASH_DICT['result.status'] = 'Passed' if RESULT_STATUS else 'Failed'
+
+        # Create a log file
+        log_file_path = module.params['log_dir_path']
+        log_file_path += '/{}.log'.format(module.params['hash_name'])
+        log_file = open(log_file_path, 'w')
+        for key, value in HASH_DICT.iteritems():
+            log_file.write(key)
+            log_file.write('\n')
+            log_file.write(str(value))
+            log_file.write('\n')
+            log_file.write('\n')
+
+        log_file.close()
+
+        # Exit the module and return the required JSON.
+        module.exit_json(
+            hash_dict=HASH_DICT,
+            log_file_path=log_file_path
+        )
+
 
 if __name__ == '__main__':
     main()

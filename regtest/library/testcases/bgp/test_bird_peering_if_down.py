@@ -124,7 +124,7 @@ def execute_commands(module, cmd):
     """
     global HASH_DICT
 
-    if 'service' in cmd and 'restart' in cmd:
+    if ('service' in cmd and 'restart' in cmd) or module.params['dry_run_mode']:
         out = None
     else:
         out = run_cli(module, cmd)
@@ -136,6 +136,46 @@ def execute_commands(module, cmd):
     HASH_DICT[key] = out
 
     return out
+
+
+def verify_ping(module):
+    """
+    Method to verify bgp neighbor relationship.
+    :param module: The Ansible module to fetch input parameters.
+    :return: Failure summary if any.
+    """
+    global RESULT_STATUS, HASH_DICT
+    failure_summary = ''
+    switch_name = module.params['switch_name']
+    leaf_list = module.params['leaf_list']
+    config_file = module.params['config_file'].splitlines()
+    self_ip = '192.168.{}.1'.format(switch_name[-2::])
+    neighbor = []
+
+    for line in config_file:
+        line = line.strip()
+        if 'neighbor' in line and 'as' in line:
+            config = line.split()
+            neighbor.append(config[1])
+
+    for leaf in leaf_list:
+        if switch_name not in leaf:
+            ip = '192.168.{}.1'.format(leaf[-2::])
+            neighbor.append(ip)
+
+    for ip in neighbor:
+        packet_count = '3'
+        ping_cmd = 'ping -w 3 -c {} -I {} {}'.format(packet_count,
+                                                     self_ip, ip)
+        ping_out = execute_commands(module, ping_cmd)
+        if '100% packet loss'.format(packet_count) in ping_out:
+            RESULT_STATUS = False
+            failure_summary += 'From switch {} '.format(
+                switch_name)
+            failure_summary += 'neighbor ip {} '.format(ip)
+            failure_summary += 'is not getting pinged\n'
+
+    return failure_summary
 
 
 def check_bgp_neighbors(module, neighbor_ips, neighbor_as):
@@ -152,12 +192,11 @@ def check_bgp_neighbors(module, neighbor_ips, neighbor_as):
     check_ping = module.params['check_ping']
     leaf_list = module.params['leaf_list']
     is_leaf = True if switch_name in leaf_list else False
-    self_ip = '192.168.{}.1'.format(switch_name[-2::])
 
     for ip in neighbor_ips:
         index = neighbor_ips.index(ip)
         as_value = neighbor_as[index]
-
+	time.sleep(module.params['delay'])
         cmd = "birdc 'show protocols all bgp{}'".format(index + 1)
         bgp_out = execute_commands(module, cmd)
 
@@ -176,41 +215,30 @@ def check_bgp_neighbors(module, neighbor_ips, neighbor_as):
                 failure_summary += 'is not Established in the output of '
                 failure_summary += 'command {}\n'.format(cmd)
 
-            if check_ping and is_leaf:
-                packet_count = '3'
-                ping_cmd = 'ping -w 3 -c {} -I {} {}'.format(packet_count,
-                                                             self_ip, ip)
-                ping_out = execute_commands(module, ping_cmd)
-                if '{} received'.format(packet_count) not in ping_out:
-                    RESULT_STATUS = False
-                    failure_summary += 'From switch {} '.format(
-                        switch_name)
-                    failure_summary += 'neighbor ip {} '.format(ip)
-                    failure_summary += 'is not getting pinged\n'
         else:
             RESULT_STATUS = False
             failure_summary += 'On switch {} '.format(switch_name)
             failure_summary += 'result cannot be verified since '
             failure_summary += 'output of command {} is None'.format(cmd)
 
+    if check_ping and is_leaf:
+        failure_summary += verify_ping(module)
+
     return failure_summary
 
 
-def change_interface_state(module, eth_list, leaf_list, state):
+def change_interface_state(module, eth_list, state):
     """
     Method to bring up/down eth interfaces.
     :param module: The Ansible module to fetch input parameters.
     :param eth_list: List of eth interfaces.
-    :param leaf_list: List of leaf switches.
     :param state: State of the interface, either up or down.
     """
-    execute_commands(module, 'ifconfig eth-{}-1 {}'.format(eth_list[1], state))
-    if leaf_list.index(module.params['switch_name']) == 0:
-        execute_commands(module, 'ifconfig eth-{}-1 {}'.format(
-            eth_list[0], state))
-    else:
-        execute_commands(module, 'ifconfig eth-{}-1 {}'.format(
-            eth_list[2], state))
+    # Bring down few eth interfaces on only leaf switches
+    for eth in eth_list:
+        eth = eth.strip()
+        cmd = 'ifconfig xeth{} {}'.format(eth, state)
+        execute_commands(module, cmd)
 
 
 def verify_bird_peering_if_down(module):
@@ -234,7 +262,7 @@ def verify_bird_peering_if_down(module):
     execute_commands(module, 'cat /etc/bird/bird.conf')
 
     # Restart and check package status
-    execute_commands(module, 'service {} restart'.format(package_name))
+    # execute_commands(module, 'service {} restart'.format(package_name))
     execute_commands(module, 'service {} status'.format(package_name))
 
     for line in config_file:
@@ -249,7 +277,7 @@ def verify_bird_peering_if_down(module):
 
     # Bring down the interfaces of leaf switches
     if is_leaf:
-        change_interface_state(module, eth_list, leaf_list, 'down')
+        change_interface_state(module, eth_list, 'down')
 
     # Wait for 160 seconds
     if not check_ping:
@@ -260,7 +288,7 @@ def verify_bird_peering_if_down(module):
 
     # Bring up the interfaces of leaf switches
     if is_leaf:
-        change_interface_state(module, eth_list, leaf_list, 'up')
+        change_interface_state(module, eth_list, 'up')
 
     # Wait for 40 seconds
     if not check_ping:
@@ -281,6 +309,9 @@ def main():
         argument_spec=dict(
             switch_name=dict(required=False, type='str'),
             config_file=dict(required=False, type='str'),
+            delay=dict(required=False, type='int'),
+            retries=dict(required=False, type='int'),
+            dry_run_mode=dict(required=False, type='bool', default=False),
             package_name=dict(required=False, type='str'),
             leaf_list=dict(required=False, type='list', default=[]),
             eth_list=dict(required=False, type='str'),
@@ -292,29 +323,90 @@ def main():
 
     global HASH_DICT, RESULT_STATUS
 
-    verify_bird_peering_if_down(module)
+    if module.params['dry_run_mode']:
+        package_name = module.params['package_name']
+        cmds_list = []
+        is_leaf = True if module.params["switch_name"] in module.params["leaf_list"] else False
+        execute_commands(module, 'cat /etc/bird/bird.conf')
+        execute_commands(module, 'service {} status'.format(package_name))
 
-    # Calculate the entire test result
-    HASH_DICT['result.status'] = 'Passed' if RESULT_STATUS else 'Failed'
+        for index in (1, 2):
+            execute_commands(module, "birdc 'show protocols all bgp{}'".format(index))
+        self_ip = '192.168.{}.1'.format(module.params["switch_name"][-2::])
+        if module.params['check_ping'] and is_leaf:
+            neighbor = list()
+            for leaf in module.params["leaf_list"]:
+                if module.params["switch_name"] not in leaf:
+                    ip = '192.168.{}.1'.format(leaf[-2::])
+                    neighbor.append(ip)
 
-    # Create a log file
-    log_file_path = module.params['log_dir_path']
-    log_file_path += '/{}.log'.format(module.params['hash_name'])
-    log_file = open(log_file_path, 'w')
-    for key, value in HASH_DICT.iteritems():
-        log_file.write(key)
-        log_file.write('\n')
-        log_file.write(str(value))
-        log_file.write('\n')
-        log_file.write('\n')
+            for ip in neighbor:
+                packet_count = '3'
+                execute_commands(module, 'ping -w 3 -c {} -I {} {}'.format(packet_count, self_ip, ip))
 
-    log_file.close()
+        if is_leaf:
+            change_interface_state(module, module.params['eth_list'].split(','), 'down')
 
-    # Exit the module and return the required JSON.
-    module.exit_json(
-        hash_dict=HASH_DICT,
-        log_file_path=log_file_path
-    )
+        if not module.params["check_ping"]:
+            time.sleep(160)
+
+        for index in (0,1):
+            execute_commands(module, "birdc 'show protocols all bgp{}'".format(index + 1))
+
+        if module.params['check_ping'] and is_leaf:
+            neighbor = list()
+            for leaf in module.params["leaf_list"]:
+                if module.params["switch_name"] not in leaf:
+                    ip = '192.168.{}.1'.format(leaf[-2::])
+                    neighbor.append(ip)
+
+            for ip in neighbor:
+                packet_count = '3'
+                execute_commands(module, 'ping -w 3 -c {} -I {} {}'.format(packet_count, self_ip, ip))
+
+        if is_leaf:
+            change_interface_state(module, module.params['eth_list'].split(','), 'up')
+
+        if not module.params["check_ping"]:
+            time.sleep(40)
+
+        for index in (0, 1):
+            execute_commands(module, "birdc 'show protocols all bgp{}'".format(index + 1))
+
+        execute_commands(module, 'goes status')
+
+        for key, value in HASH_DICT.iteritems():
+            cmds_list.append(key)
+        # Exit the module and return the required JSON.
+        module.exit_json(
+            cmds=cmds_list
+        )
+    else:
+
+        verify_bird_peering_if_down(module)
+
+        # Calculate the entire test result
+        HASH_DICT['result.status'] = 'Passed' if RESULT_STATUS else 'Failed'
+
+        # Create a log file
+        log_file_path = module.params['log_dir_path']
+        log_file_path += '/{}.log'.format(module.params['hash_name'])
+        log_file = open(log_file_path, 'w')
+        for key, value in HASH_DICT.iteritems():
+            log_file.write(key)
+            log_file.write('\n')
+            log_file.write(str(value))
+            log_file.write('\n')
+            log_file.write('\n')
+
+        log_file.close()
+
+        # Exit the module and return the required JSON.
+        module.exit_json(
+            hash_dict=HASH_DICT,
+            log_file_path=log_file_path
+        )
+
 
 if __name__ == '__main__':
     main()

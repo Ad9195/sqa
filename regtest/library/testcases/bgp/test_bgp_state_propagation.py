@@ -112,7 +112,7 @@ def execute_commands(module, cmd):
     """
     global HASH_DICT
 
-    if 'service' in cmd or 'dummy' in cmd or 'restart' in cmd:
+    if 'dummy' in cmd or 'restart' in cmd or module.params['dry_run_mode']:
         out = None
     else:
         out = run_cli(module, cmd)
@@ -148,19 +148,16 @@ def verify_bgp_routes(module, route_present):
 
         if route_present:
             if route not in out:
-                RESULT_STATUS = False
                 failure_summary += 'On Switch {} bgp route '.format(switch_name)
                 failure_summary += '{} is not present '.format(route)
                 failure_summary += 'in the output of command {}\n'.format(cmd)
         else:
             if route in out:
-                RESULT_STATUS = False
                 failure_summary += 'On Switch {} bgp route '.format(switch_name)
                 failure_summary += '{} is present '.format(route)
                 failure_summary += 'in the output of command {} '.format(cmd)
                 failure_summary += 'even after shutting down this route\n'
     else:
-        RESULT_STATUS = False
         failure_summary += 'On switch {} '.format(switch_name)
         failure_summary += 'bgp routes cannot be verified '
         failure_summary += 'because output of command {} '.format(cmd)
@@ -180,6 +177,8 @@ def verify_quagga_bgp_state_propagation(module):
     package_name = module.params['package_name']
     propagate_switch = module.params['propagate_switch']
     eth_list = module.params['eth_list'].split(',')
+    delay = module.params['delay']
+    aretries = module.params['retries']
 
     if switch_name == propagate_switch:
         # Add dummy0 interface
@@ -198,38 +197,92 @@ def verify_quagga_bgp_state_propagation(module):
     execute_commands(module, 'service {} restart'.format(package_name))
     execute_commands(module, 'service {} status'.format(package_name))
 
+    retries = 1
+    found = False
+    retries_summary = ''
+
     # Verify bgp routes
     if switch_name != propagate_switch:
-        failure_summary += verify_bgp_routes(module, True)
+        while retries != aretries and not found:
+            # Wait 100 secs(max) for routes to become reachable
+            time.sleep(delay)
+            summary = verify_bgp_routes(module, True)
+            if not summary:
+                found = True
+                summary = 'No. of retries {}'.format(retries)
+            else:
+                retries += 1
+        if not found:
+            RESULT_STATUS = False
+            failure_summary += summary
+            retries_summary += 'No. of retries {} approx {} sec(initial verification)\n'.format(retries, retries*10)
+        else:
+            retries_summary += 'No. of retries {} approx {} sec(initial verification)\n'.format(retries, retries*10)
 
     # Bring down few interfaces on propagate switch
     if switch_name == propagate_switch:
         for eth in eth_list:
             eth = eth.strip()
-            cmd = 'ifconfig eth-{}-1 down'.format(eth)
+            cmd = 'ifconfig xeth{} down'.format(eth)
             execute_commands(module, cmd)
+            time.sleep(10)
 
-    # Wait 200 secs for routes to become unreachable
-    time.sleep(200)
+    retries = 1
+    found = False
 
     # Verify bgp routes
     if switch_name != propagate_switch:
-        failure_summary += verify_bgp_routes(module, False)
+        while retries != 21 and not found:
+            # Wait 200 secs(max) for routes to become unreachable
+            time.sleep(10)
+            summary = verify_bgp_routes(module, False)
+            if not summary:
+                found = True
+                summary = 'No. of retries {}'.format(retries)
+            else:
+                retries += 1
+        if not found:
+            RESULT_STATUS = False
+            failure_summary += summary
+            retries_summary += 'No. of retries {} approx {} sec(after bringing down interface)\n'.format(retries, retries*10)
+        else:
+            retries_summary += 'No. of retries {} approx {} sec(after bringing down interface)\n'.format(retries, retries*10)
+
+    # Sync the invaders
+    if switch_name == propagate_switch:
+        time.sleep(211)
+    else:
+        time.sleep(211-(retries*10))
 
     # Bring up interfaces on propagate switch
     if switch_name == propagate_switch:
         for eth in eth_list:
             eth = eth.strip()
-            cmd = 'ifconfig eth-{}-1 up'.format(eth)
+            cmd = 'ifconfig xeth{} up'.format(eth)
             execute_commands(module, cmd)
 
-    # Wait 60 secs for routes to become unreachable
-    time.sleep(60)
+    retries = 1
+    found = False
 
     # Verify bgp routes
     if switch_name != propagate_switch:
-        failure_summary += verify_bgp_routes(module, True)
+        while retries != 15 and not found:
+            # Wait 150 secs(max) for routes to become reachable
+            time.sleep(10)
+            summary = verify_bgp_routes(module, True)
+            if not summary:
+                found = True
+                summary = 'No. of retries {}'.format(retries)
+            else:
+                retries += 1
+        if not found:
+            RESULT_STATUS = False
+            failure_summary += summary
+            retries_summary += 'No. of retries {} approx {} sec(after bringing up interface again)\n'.format(retries, retries*10)
+        else:
+            retries_summary += 'No. of retries {} approx {} sec(after bringing up interface again)\n'.format(retries, retries*10)
 
+    HASH_DICT['retries'] = retries_summary
     HASH_DICT['result.detail'] = failure_summary
 
     # Get the GOES status info
@@ -246,35 +299,97 @@ def main():
             package_name=dict(required=False, type='str'),
             hash_name=dict(required=False, type='str'),
             log_dir_path=dict(required=False, type='str'),
+            delay=dict(required=False, type='int', default=10),
+            retries=dict(required=False, type='int', default=6),
+            dry_run_mode=dict(required=False, type='bool', default=False),
         )
     )
 
     global HASH_DICT, RESULT_STATUS
+    if module.params['dry_run_mode']:
+        eth_list = module.params['eth_list'].split(',')
+        switch_name = module.params['switch_name']
+        package_name = module.params['package_name']
+        propagate_switch = module.params['propagate_switch']
+        cmds_list = []
 
-    verify_quagga_bgp_state_propagation(module)
+        if switch_name == propagate_switch:
+            # Add dummy0 interface
+            execute_commands(module, 'ip link add dummy0 type dummy')
 
-    # Calculate the entire test result
-    HASH_DICT['result.status'] = 'Passed' if RESULT_STATUS else 'Failed'
+            # Assign ip to this created dummy0 interface
+            cmd = 'ifconfig dummy0 192.168.{}.1 netmask 255.255.255.255'.format(
+                switch_name[-2::]
+            )
+            execute_commands(module, cmd)
 
-    # Create a log file
-    log_file_path = module.params['log_dir_path']
-    log_file_path += '/{}.log'.format(module.params['hash_name'])
-    log_file = open(log_file_path, 'a')
-    for key, value in HASH_DICT.iteritems():
-        log_file.write(key)
-        log_file.write('\n')
-        log_file.write(str(value))
-        log_file.write('\n')
-        log_file.write('\n')
+        # Get the current/running configurations
+        execute_commands(module, "vtysh -c 'sh running-config'")
 
-    log_file.close()
+        # Restart and check package status
+        execute_commands(module, 'service {} restart'.format(package_name))
+        execute_commands(module, 'service {} status'.format(package_name))
 
-    # Exit the module and return the required JSON.
-    module.exit_json(
-        hash_dict=HASH_DICT,
-        log_file_path=log_file_path
-    )
+        if switch_name != propagate_switch:
+                # Wait 100 secs(max) for routes to become reachable
+                cmd = "vtysh -c 'sh ip route'"
+                execute_commands(module, cmd)
+
+        if switch_name == propagate_switch:
+            for eth in eth_list:
+                eth = eth.strip()
+                cmd = 'ifconfig xeth{} down'.format(eth)
+                execute_commands(module, cmd)
+
+        if switch_name != propagate_switch:
+                # Wait 100 secs(max) for routes to become reachable
+                cmd = "vtysh -c 'sh ip route'"
+                execute_commands(module, cmd)
+
+        if switch_name == propagate_switch:
+            for eth in eth_list:
+                eth = eth.strip()
+                cmd = 'ifconfig xeth{} up'.format(eth)
+                execute_commands(module, cmd)
+
+        if switch_name != propagate_switch:
+                # Wait 100 secs(max) for routes to become reachable
+                cmd = "vtysh -c 'sh ip route'"
+                execute_commands(module, cmd)
+
+        for key, value in HASH_DICT.iteritems():
+            cmds_list.append(key)
+
+        # Exit the module and return the required JSON.
+        module.exit_json(
+            cmds=cmds_list
+        )
+    else:
+        verify_quagga_bgp_state_propagation(module)
+
+        # Calculate the entire test result
+        HASH_DICT['result.status'] = 'Passed' if RESULT_STATUS else 'Failed'
+
+        # Create a log file
+        log_file_path = module.params['log_dir_path']
+        log_file_path += '/{}.log'.format(module.params['hash_name'])
+        log_file = open(log_file_path, 'a')
+        for key, value in HASH_DICT.iteritems():
+            log_file.write(key)
+            log_file.write('\n')
+            log_file.write(str(value))
+            log_file.write('\n')
+            log_file.write('\n')
+
+        log_file.close()
+
+        # Exit the module and return the required JSON.
+        module.exit_json(
+            hash_dict=HASH_DICT,
+            log_file_path=log_file_path
+        )
 
 if __name__ == '__main__':
     main()
+
 
